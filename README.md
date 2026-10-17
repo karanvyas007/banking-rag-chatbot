@@ -2,7 +2,7 @@
 
 A retrieval-augmented generation (RAG) chatbot that answers questions about banking policies and FAQs, retrieves the relevant passages, and cites its sources.
 
-> **Status:** document ingestion and vector indexing are complete; answer generation is next.
+> **Status:** ingestion, retrieval and the grounded `/ask` API are complete; the chat UI is next.
 >
 > All documents are **synthetic**: policies of *Fernhollow Bank*, a fictional bank. No real customer data.
 
@@ -29,16 +29,20 @@ Streamlit UI  ──HTTP──▶  FastAPI backend  ──▶  Retriever (Chroma
 backend/
   main.py         FastAPI app (entry point)
   config.py       Settings loaded from environment / .env
+  schemas.py      Pydantic request/response models for the API
   embeddings.py   gemini-embedding-2 adapter (LangChain Embeddings interface)
   vectorstore.py  ChromaDB collection access and config checks
   ingestion/      Load, chunk and index documents (python -m backend.ingestion)
-  retrieval/      Query the vector store and generate cited answers
+  retrieval/
+    retriever.py  Similarity search with a relevance threshold
+    qa.py         Prompting, answer generation and citation validation
 frontend/
   app.py          Streamlit UI
 data/
   raw/            Source documents (public/synthetic; committed)
   chroma/         Generated vector store (git-ignored)
-tests/            pytest suite
+eval/             Live evaluation set (questions.json) and runner
+tests/            pytest suite (offline; Gemini and embeddings are mocked)
 ```
 
 ## Setup
@@ -72,19 +76,101 @@ How ingestion works:
 
 ## Run
 
+Index the documents first (see above), then:
+
 ```bash
-# Backend (http://localhost:8000, docs at /docs)
+# Backend (http://localhost:8000, interactive docs at /docs)
 uvicorn backend.main:app --reload
 
 # Frontend (in a second terminal)
 streamlit run frontend/app.py
 ```
 
+## Ask a question
+
+```bash
+curl -s -X POST http://localhost:8000/ask \
+  -H "Content-Type: application/json" \
+  -d '{"question": "Can I use my mobile phone bill as proof of address?"}'
+```
+
+`top_k` (1–10) is optional and overrides `RETRIEVAL_TOP_K` for one request. Example response (abridged):
+
+```json
+{
+  "answer": "No, mobile phone bills are not accepted as proof of address [1].",
+  "answered": true,
+  "abstain_reason": null,
+  "citations": [
+    {
+      "id": 1,
+      "source": "kyc-account-opening.md",
+      "title": "Account Opening and Identity Verification (KYC)",
+      "section": "Proof of Address",
+      "chunk_index": 4,
+      "relevance": 0.7819,
+      "excerpt": "## Proof of Address Applicants must also provide one proof of address dated within the last **3 months**, ..."
+    }
+  ],
+  "retrieved": [
+    {"id": 1, "source": "kyc-account-opening.md", "title": "Account Opening and Identity Verification (KYC)", "section": "Proof of Address", "relevance": 0.7819}
+  ],
+  "model": "gemini-3.8-flash"
+}
+```
+
+When the documents don't cover a question, the API abstains instead of guessing:
+
+```json
+{
+  "answer": "I couldn't find this in the available Fernhollow Bank documents, so I can't answer it reliably. Please contact Fernhollow Bank customer service for help with this question.",
+  "answered": false,
+  "abstain_reason": "no_relevant_documents",
+  "citations": [],
+  "retrieved": [],
+  "model": null
+}
+```
+
+| `abstain_reason` | Meaning |
+|---|---|
+| `no_relevant_documents` | No passage met `MIN_RELEVANCE`; the chat model was not called |
+| `not_in_documents` | Passages were retrieved, but the model found they don't answer the question |
+| `no_valid_citations` | The model answered but cited no retrieved passage, so the answer was discarded |
+
+Errors return `{"detail": "..."}` with a fixed message: `422` invalid request, `429` Gemini rate limit (with `Retry-After`), `503` index missing/empty/incompatible, API key not set, or Gemini temporarily overloaded, `502` other model failures.
+
+### How answers are grounded
+
+- **Retrieval:** the question is embedded with the same model and the documented query prefix as the index. The top `RETRIEVAL_TOP_K` chunks are kept only if their cosine relevance is at least `MIN_RELEVANCE`.
+- **Prompt:** the model sees only numbered passages and is told to answer from them alone, cite passage numbers, and set `answerable: false` when they don't contain the answer. It replies in JSON enforced by a response schema.
+- **Citation validation:** the model returns passage *numbers*, never filenames. Each number is checked against the retrieved passages; invalid ones are dropped, along with their `[n]` markers in the answer text. Source, title and section always come from the index metadata.
+
+## Evaluate
+
+```bash
+python -m eval.run_eval    # makes real Gemini API calls (~20 requests; free tier)
+```
+
+[eval/questions.json](eval/questions.json) has 12 supported questions (mostly paraphrased, with the expected source and key facts) and 6 unsupported ones, including near misses such as the bank's CEO or an unlisted credit card APR. Latest run (17 Oct 2026, `gemini-3.8-flash` + `gemini-embedding-2`): **12/12 supported answered correctly, 6/6 unsupported abstained.** The set is small and model output varies between runs, so treat this as a smoke test, not a benchmark.
+
 ## Test
 
 ```bash
 pytest
 ```
+
+The suite runs offline: Gemini and the embeddings are replaced by fakes, so it makes no network calls and costs nothing.
+
+## Known limitations
+
+- **Small, synthetic corpus.** Eight short fictional documents; behaviour on large or messy real-world documents is untested.
+- **Threshold calibrated on this corpus.** `MIN_RELEVANCE=0.65` separated supported (≥0.72) from unrelated (≤0.63) questions here, but questions mentioning the bank's name can score ~0.7 without being answerable. Those rely on the model abstaining. Re-calibrate if the documents change.
+- **Single-turn only.** No conversation history; each question is answered independently.
+- **No retry/backoff on Gemini errors.** Rate limits and overloads are returned to the caller as `429`/`503`. Free-tier limits are low.
+- **Restart after re-indexing.** The API opens the index on the first request; restart it after `python -m backend.ingestion --reset`.
+- **Synchronous calls.** Each request blocks a worker thread while Gemini responds; fine for a demo, not tuned for load.
+- **Not financial advice.** Answers describe a fictional bank's fictional policies.
 
 ## Configuration
 
@@ -97,6 +183,9 @@ All settings live in `.env` (see [.env.example](.env.example)):
 | `GEMINI_EMBEDDING_MODEL` | `gemini-embedding-2` | Embedding model |
 | `EMBEDDING_DIMENSION` | `3072` | Embedding size (128–3072) |
 | `CHUNK_SIZE` / `CHUNK_OVERLAP` | `1000` / `150` | Chunking, in characters |
+| `RETRIEVAL_TOP_K` | `4` | Passages retrieved per question (1–10) |
+| `MIN_RELEVANCE` | `0.65` | Minimum cosine relevance (0–1) for a passage to be used |
+| `LLM_TIMEOUT_SECONDS` / `LLM_MAX_RETRIES` | `60` / `1` | Chat model request limits |
 | `CHROMA_PERSIST_DIR` | `data/chroma` | Vector store location |
 | `CHROMA_COLLECTION` | `banking_docs` | Collection name |
 | `DOCS_DIR` | `data/raw` | Documents to ingest |
@@ -107,6 +196,6 @@ All settings live in `.env` (see [.env.example](.env.example)):
 - [x] Project foundation, config, health check, tests
 - [x] Synthetic banking policy documents and FAQs
 - [x] Ingestion pipeline (chunking + embeddings + ChromaDB)
-- [ ] Retrieval and `/ask` endpoint with source citations
+- [x] Retrieval and `/ask` endpoint with source citations
+- [x] Small live evaluation set
 - [ ] Streamlit chat UI showing answers and sources
-- [ ] Retrieval quality evaluation

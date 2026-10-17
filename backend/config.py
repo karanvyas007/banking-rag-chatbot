@@ -3,7 +3,7 @@
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -29,6 +29,13 @@ class Settings(BaseSettings):
 
     chunk_size: int = 1000
     chunk_overlap: int = 150
+
+    retrieval_top_k: int = Field(default=4, ge=1, le=10)
+    # Cosine relevance (1 - distance). Calibrated on the sample corpus: supported questions
+    # score ~0.75+, off-topic ones ~0.50-0.63. Chunks below this are never shown to the model.
+    min_relevance: float = Field(default=0.65, ge=0.0, le=1.0)
+    llm_timeout_seconds: float = 60.0
+    llm_max_retries: int = 1
 
     @field_validator("chroma_persist_dir", "docs_dir")
     @classmethod
