@@ -2,7 +2,7 @@
 
 A retrieval-augmented generation (RAG) chatbot that answers questions about banking policies and FAQs, retrieves the relevant passages, and cites its sources.
 
-> **Status:** ingestion, retrieval and the grounded `/ask` API are complete; the chat UI is next.
+> **Status:** ingestion, retrieval, the grounded `/ask` API and the Streamlit chat UI are complete.
 >
 > All documents are **synthetic**: policies of *Fernhollow Bank*, a fictional bank. No real customer data.
 
@@ -37,7 +37,8 @@ backend/
     retriever.py  Similarity search with a relevance threshold
     qa.py         Prompting, answer generation and citation validation
 frontend/
-  app.py          Streamlit UI
+  app.py            Streamlit chat UI
+  backend_client.py HTTP client for /ask and /health (maps every result to answer/abstain/error)
 data/
   raw/            Source documents (public/synthetic; committed)
   chroma/         Generated vector store (git-ignored)
@@ -74,17 +75,31 @@ How ingestion works:
 - **Idempotency:** a content fingerprint per file decides what happens. Unchanged files are skipped (no API calls), changed files have all their chunks replaced, and deleted or emptied files are removed from the index. New embeddings are computed before anything is deleted, so a failed API call leaves the index as it was.
 - **Consistency:** the Chroma collection uses cosine distance and records the embedding model and dimension. Opening it with a different configuration fails with a clear error instead of mixing incompatible vectors.
 
-## Run
+## Run locally
 
-Index the documents first (see above), then:
+Index the documents first (see above). Then start the API and the UI in two terminals, both from the project root with the virtual environment activated:
 
 ```bash
-# Backend (http://localhost:8000, interactive docs at /docs)
+# Terminal 1: FastAPI backend on http://localhost:8000 (interactive docs at /docs)
+source .venv/bin/activate
 uvicorn backend.main:app --reload
 
-# Frontend (in a second terminal)
+# Terminal 2: Streamlit chat UI on http://localhost:8501
+source .venv/bin/activate
 streamlit run frontend/app.py
 ```
+
+If the API runs elsewhere, start the UI with `BACKEND_URL=http://host:port streamlit run frontend/app.py`.
+
+### The chat UI
+
+- Type a question or click an example. Each reply appears as one of three clearly different states:
+  - **Answer**, with a collapsible **Sources** list showing each cited document's title, section, filename and an excerpt.
+  - **Not covered by the documents** (blue info box): the backend abstained, with a note on why.
+  - **Something went wrong** (amber if retrying may help, red otherwise): the API was unreachable, timed out, was rate limited (`429`), was unavailable (`503`) or failed. Messages are written by the UI; backend error bodies and stack traces are never displayed.
+- The sidebar shows whether the API is reachable and has a Gemini key configured.
+- The conversation is kept for the browser session (across Streamlit reruns) and can be cleared from the sidebar. **Each question is answered independently:** the backend has no conversational memory, so follow-ups like "what about abroad?" aren't understood in context.
+- The UI only displays what the API returns. Retrieval, answers, citations and abstention are all decided by the backend.
 
 ## Ask a question
 
@@ -160,13 +175,14 @@ python -m eval.run_eval    # makes real Gemini API calls (~20 requests; free tie
 pytest
 ```
 
-The suite runs offline: Gemini and the embeddings are replaced by fakes, so it makes no network calls and costs nothing.
+The suite runs offline: Gemini and the embeddings are replaced by fakes, and the UI tests mock HTTP (`httpx.MockTransport`) and drive the app with Streamlit's `AppTest`. It makes no network calls and costs nothing.
 
 ## Known limitations
 
 - **Small, synthetic corpus.** Eight short fictional documents; behaviour on large or messy real-world documents is untested.
 - **Threshold calibrated on this corpus.** `MIN_RELEVANCE=0.65` separated supported (≥0.72) from unrelated (≤0.63) questions here, but questions mentioning the bank's name can score ~0.7 without being answerable. Those rely on the model abstaining. Re-calibrate if the documents change.
-- **Single-turn only.** No conversation history; each question is answered independently.
+- **Single-turn only.** The UI shows the conversation, but each question is answered independently; follow-up questions don't use earlier messages as context.
+- **Chat history is per browser session.** It lives in Streamlit session state and is lost when the page is reloaded.
 - **No retry/backoff on Gemini errors.** Rate limits and overloads are returned to the caller as `429`/`503`. Free-tier limits are low.
 - **Restart after re-indexing.** The API opens the index on the first request; restart it after `python -m backend.ingestion --reset`.
 - **Synchronous calls.** Each request blocks a worker thread while Gemini responds; fine for a demo, not tuned for load.
@@ -189,7 +205,8 @@ All settings live in `.env` (see [.env.example](.env.example)):
 | `CHROMA_PERSIST_DIR` | `data/chroma` | Vector store location |
 | `CHROMA_COLLECTION` | `banking_docs` | Collection name |
 | `DOCS_DIR` | `data/raw` | Documents to ingest |
-| `BACKEND_URL` | `http://localhost:8000` | Used by the frontend (read from the shell environment, not `.env`) |
+| `BACKEND_URL` | `http://localhost:8000` | API address used by the UI (read from the shell environment, not `.env`) |
+| `BACKEND_TIMEOUT_SECONDS` | `90` | How long the UI waits for `/ask` (shell environment) |
 
 ## Roadmap
 
@@ -198,4 +215,4 @@ All settings live in `.env` (see [.env.example](.env.example)):
 - [x] Ingestion pipeline (chunking + embeddings + ChromaDB)
 - [x] Retrieval and `/ask` endpoint with source citations
 - [x] Small live evaluation set
-- [ ] Streamlit chat UI showing answers and sources
+- [x] Streamlit chat UI showing answers and sources
